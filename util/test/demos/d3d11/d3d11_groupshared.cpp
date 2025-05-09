@@ -30,45 +30,93 @@ RD_TEST(D3D11_Groupshared, D3D11GraphicsTest)
 
   std::string comp = R"EOSHADER(
 
+#define MAX_THREADS 64
+
 RWStructuredBuffer<float> indata : register(u0);
 RWStructuredBuffer<float4> outdata : register(u1);
 
-groupshared float tmp[64];
+groupshared float gsmData[MAX_THREADS];
 
-[numthreads(64,1,1)]
-void main(uint3 tid : SV_GroupThreadID)
+cbuffer consts : register(b0)
 {
-  if(tid.x == 0)
+  int inTest;
+};
+
+#define IsTest(x) (inTest == x)
+
+float GetGSMValue(uint i)
+{
+  return gsmData[i % MAX_THREADS];
+}
+
+[numthreads(MAX_THREADS,1,1)]
+void main(uint3 gid : SV_GroupThreadID)
+{
+  if(gid.x == 0)
   {
-    for(int i=0; i < 64; i++) tmp[i] = 1.234f;
+    for(int i=0; i < MAX_THREADS; i++) gsmData[i] = 1.25f;
   }
 
   GroupMemoryBarrierWithGroupSync();
 
-  float4 outval;
+  float4 outval = 0.0f.xxxx;
 
-  // first write, should be the init value for all threads
-  outval.x = tmp[tid.x];
+  if (IsTest(0))
+  {
+    // first write, should be the init value for all threads
+    outval.x = GetGSMValue(gid.x);
 
-  tmp[tid.x] = indata[tid.x];
+    gsmData[gid.x] = indata[gid.x];
 
-  // second write, should be the read value because we're reading our own value
-  outval.y = tmp[tid.x];
+    // second write, should be the read value because we're reading our own value
+    outval.y = GetGSMValue(gid.x);
 
-  GroupMemoryBarrierWithGroupSync();
+    GroupMemoryBarrierWithGroupSync();
 
-  // third write, should be our pairwise neighbour's value
-  outval.z = tmp[tid.x ^ 1];
+    // third write, should be our pairwise neighbour's value
+    outval.z = GetGSMValue(gid.x ^ 1);
 
-  // do calculation with our neighbour
-  tmp[tid.x] = (1.0f + tmp[tid.x]) * (1.0f + tmp[tid.x ^ 1]);
+    // do calculation with our neighbour
+    gsmData[gid.x] = (1.0f + GetGSMValue(gid.x)) * (1.0f + GetGSMValue(gid.x ^ 1));
 
-  GroupMemoryBarrierWithGroupSync();
+    GroupMemoryBarrierWithGroupSync();
 
-  // fourth write, our neighbour should be identical to our value
-  outval.w = tmp[tid.x] == tmp[tid.x ^ 1] ? 9.99f : -9.99f;
+    // fourth write, our neighbour should be identical to our value
+    outval.w = GetGSMValue(gid.x) == GetGSMValue(gid.x ^ 1) ? 9.99f : -9.99f;
+  }
+  else if (IsTest(1))
+  {
+    gsmData[gid.x] = (float)gid.x;
+    gsmData[gid.x] += 10.0f;
+    GroupMemoryBarrierWithGroupSync();
 
-  outdata[tid.x] = outval;
+    outval.x = GetGSMValue(gid.x);
+    outval.y = GetGSMValue(gid.x + 1);
+
+    GroupMemoryBarrierWithGroupSync();
+    gsmData[gid.x] += 10.0f;
+    GroupMemoryBarrierWithGroupSync();
+
+    outval.z = GetGSMValue(gid.x + 2);
+
+    GroupMemoryBarrierWithGroupSync();
+    gsmData[gid.x] += 10.0f;
+    GroupMemoryBarrierWithGroupSync();
+
+    outval.w = GetGSMValue(gid.x + 3);
+  }
+  else if (IsTest(2))
+  {
+    // Deliberately no sync to test debugger behaviour not GPU correctness
+    // Debugger should see the initial value of 1.25f for all of GSM
+    gsmData[gid.x] = (float)gid.x;
+    outval.x = GetGSMValue(gid.x);
+    outval.y = GetGSMValue(gid.x + 1);
+    outval.z = GetGSMValue(gid.x + 2);
+    outval.w = GetGSMValue(gid.x + 3);
+  }
+
+  outdata[gid.x] = outval;
 }
 
 )EOSHADER";
@@ -90,18 +138,37 @@ void main(uint3 tid : SV_GroupThreadID)
 
     ID3D11ComputeShaderPtr shad = CreateCS(Compile(comp, "main", "cs_5_0", true));
 
+    int cbufferdata[4];
+    memset(cbufferdata, 0, sizeof(cbufferdata));
+    ID3D11BufferPtr cb = MakeBuffer().Size(16).Constant().Data(&cbufferdata);
+
+    int numCompTests = 0;
+    size_t pos = 0;
+    while(pos != std::string::npos)
+    {
+      pos = comp.find("IsTest(", pos);
+      if(pos == std::string::npos)
+        break;
+      pos += sizeof("IsTest(") - 1;
+      numCompTests = std::max(numCompTests, atoi(comp.c_str() + pos) + 1);
+    }
+
     while(Running())
     {
       ClearRenderTargetView(bbRTV, {0.2f, 0.2f, 0.2f, 1.0f});
-
-      ClearUnorderedAccessView(outUAV, Vec4u());
 
       ctx->CSSetShader(shad, NULL, 0);
       ctx->CSSetUnorderedAccessViews(0, 1, &inUAV.GetInterfacePtr(), NULL);
       ctx->CSSetUnorderedAccessViews(1, 1, &outUAV.GetInterfacePtr(), NULL);
 
       pushMarker("Compute Tests");
-      ctx->Dispatch(1, 1, 1);
+      for(int i = 0; i < numCompTests; ++i)
+      {
+        ClearUnorderedAccessView(outUAV, Vec4u());
+        ctx->UpdateSubresource(cb, 0, NULL, &i, 4, 0);
+        ctx->CSSetConstantBuffers(0, 1, &cb.GetInterfacePtr());
+        ctx->Dispatch(1, 1, 1);
+      }
       popMarker();
 
       Present();

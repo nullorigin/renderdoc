@@ -12,10 +12,8 @@ class Groupshared(rdtest.TestCase):
             return True, ''
         return False, 'Disabled test'
 
-    def check_compute_thread_result(self, test, action, x, y, z, dim, bufdata):
+    def check_compute_thread_result(self, test, action, x, y, z, expected):
         try:
-            real = struct.unpack_from("4f", bufdata, 16*x)
-
             workgroup = (0, 0, 0)
             trace = self.controller.DebugThread(workgroup, (x, y, z))
 
@@ -45,11 +43,14 @@ class Groupshared(rdtest.TestCase):
 
             debuggedValue = list(debugged.value.f32v[0:4])
 
-            if not rdtest.value_compare(real, debuggedValue, eps=5.0E-06):
-                raise rdtest.TestFailureException(f"EID:{action.eventId} TID:{x},{y},{z} debugged thread value {debuggedValue} does not match output {real}")
+            if not rdtest.value_compare(expected, debuggedValue, eps=5.0E-06):
+                raise rdtest.TestFailureException(f"EID:{action.eventId} TID:{x},{y},{z} debugged thread value {debuggedValue} does not match output {expected}")
 
         except rdtest.TestFailureException as ex:
             rdtest.log.error(f"Test {test} failed {ex}")
+            return False
+        except Exception as ex:
+            rdtest.log.error(f"Test {test} exception {ex}")
             return False
         finally:
             self.controller.FreeTrace(trace)
@@ -72,7 +73,7 @@ class Groupshared(rdtest.TestCase):
             rw = pipe.GetReadWriteResources(rd.ShaderStage.Compute)
 
             if len(rw) != 2:
-                rdtest.log.error("Unexpected number of RW resources")
+                rdtest.log.error(f"Unexpected number of RW resources {len(rw)}")
                 return False
 
             outBuf = rw[1].descriptor.resource
@@ -80,12 +81,17 @@ class Groupshared(rdtest.TestCase):
             maxThreads = 64
             dataPerThread = 4 * 4
             dataPerTest = dataPerThread * maxThreads
-            bufdata = self.controller.GetBufferData(outBuf, test*dataPerTest, dataPerTest)
+            bufdata = self.controller.GetBufferData(outBuf, 0, dataPerTest)
 
             for x in range(dim[0]):
                 y = 0
                 z = 0
-                if not self.check_compute_thread_result(test, action, x, y, z, dim, bufdata):
+                expected = struct.unpack_from("4f", bufdata, 16*x)
+                # Test 2 is a special case with hard coded results
+                if test == 2:
+                    expected = [x, 1.25, 1.25, 1.25]
+
+                if not self.check_compute_thread_result(test, action, x, y, z, expected):
                     failed = True
 
             overallFailed |= failed
@@ -97,18 +103,17 @@ class Groupshared(rdtest.TestCase):
 
         return overallFailed
 
-    def check_capture(self):
-        overallFailed = False
-
-        action = self.find_action("Compute Tests")
-        sectionName = action.customName
+    def check_compute_section_tests(self, sectionAction):
+        sectionName = sectionAction.customName
         rdtest.log.begin_section(sectionName)
-        overallFailed |= self.check_compute_tests(action)
+        failed = self.check_compute_tests(sectionAction)
         rdtest.log.end_section(sectionName)
-
-        if overallFailed:
+        if failed:
             raise rdtest.TestFailureException("Some tests were not as expected")
 
+    def check_capture(self):
+        action = self.find_action("Compute Tests")
+        self.check_compute_section_tests(action)
         self.check_renderdoc_log_asserts()
 
         rdtest.log.success("All tests matched")

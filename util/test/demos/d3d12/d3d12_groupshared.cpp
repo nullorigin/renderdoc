@@ -30,45 +30,93 @@ RD_TEST(D3D12_Groupshared, D3D12GraphicsTest)
 
   std::string comp = R"EOSHADER(
 
+#define MAX_THREADS 64
+
 RWStructuredBuffer<float> indata : register(u0);
 RWStructuredBuffer<float4> outdata : register(u1);
 
-groupshared float tmp[64];
-
-[numthreads(64,1,1)]
-void main(uint3 tid : SV_GroupThreadID)
+cbuffer rootconsts : register(b0)
 {
-  if(tid.x == 0)
+  uint root_test;
+}
+
+groupshared float gsmData[MAX_THREADS];
+
+#define IsTest(x) (root_test == x)
+
+float GetGSMValue(uint i)
+{
+  return gsmData[i % MAX_THREADS];
+}
+
+[numthreads(MAX_THREADS,1,1)]
+void main(uint3 gid : SV_GroupThreadID)
+{
+  if(gid.x == 0)
   {
-    for(int i=0; i < 64; i++) tmp[i] = 1.234f;
+    for(int i=0; i < MAX_THREADS; i++) gsmData[i] = 1.25f;
   }
 
   GroupMemoryBarrierWithGroupSync();
 
-  float4 outval;
+  float4 outval = 0.0f.xxxx;
 
-  // first write, should be the init value for all threads
-  outval.x = tmp[tid.x];
+  if (IsTest(0))
+  {
+    // first write, should be the init value for all threads
+    outval.x = GetGSMValue(gid.x);
 
-  tmp[tid.x] = indata[tid.x];
+    gsmData[gid.x] = indata[gid.x];
 
-  // second write, should be the read value because we're reading our own value
-  outval.y = tmp[tid.x];
+    // second write, should be the read value because we're reading our own value
+    outval.y = GetGSMValue(gid.x);
 
-  GroupMemoryBarrierWithGroupSync();
+    GroupMemoryBarrierWithGroupSync();
 
-  // third write, should be our pairwise neighbour's value
-  outval.z = tmp[tid.x ^ 1];
+    // third write, should be our pairwise neighbour's value
+    outval.z = GetGSMValue(gid.x ^ 1);
 
-  // do calculation with our neighbour
-  tmp[tid.x] = (1.0f + tmp[tid.x]) * (1.0f + tmp[tid.x ^ 1]);
+    // do calculation with our neighbour
+    gsmData[gid.x] = (1.0f + GetGSMValue(gid.x)) * (1.0f + GetGSMValue(gid.x ^ 1));
 
-  GroupMemoryBarrierWithGroupSync();
+    GroupMemoryBarrierWithGroupSync();
 
-  // fourth write, our neighbour should be identical to our value
-  outval.w = tmp[tid.x] == tmp[tid.x ^ 1] ? 9.99f : -9.99f;
+    // fourth write, our neighbour should be identical to our value
+    outval.w = GetGSMValue(gid.x) == GetGSMValue(gid.x ^ 1) ? 9.99f : -9.99f;
+  }
+  else if (IsTest(1))
+  {
+    gsmData[gid.x] = (float)gid.x;
+    gsmData[gid.x] += 10.0f;
+    GroupMemoryBarrierWithGroupSync();
 
-  outdata[tid.x] = outval;
+    outval.x = GetGSMValue(gid.x);
+    outval.y = GetGSMValue(gid.x + 1);
+
+    GroupMemoryBarrierWithGroupSync();
+    gsmData[gid.x] += 10.0f;
+    GroupMemoryBarrierWithGroupSync();
+
+    outval.z = GetGSMValue(gid.x + 2);
+
+    GroupMemoryBarrierWithGroupSync();
+    gsmData[gid.x] += 10.0f;
+    GroupMemoryBarrierWithGroupSync();
+
+    outval.w = GetGSMValue(gid.x + 3);
+  }
+  else if (IsTest(2))
+  {
+    // Deliberately no sync to test debugger behaviour not GPU correctness
+    // Debugger should see the initial value of 1.25f for all of GSM
+    gsmData[gid.x] = (float)gid.x;
+    outval.x = GetGSMValue(gid.x);
+    outval.y = GetGSMValue(gid.x + 1);
+    outval.z = GetGSMValue(gid.x + 2);
+    outval.w = GetGSMValue(gid.x + 3);
+  }
+
+  outdata[gid.x] = outval;
 }
 
 )EOSHADER";
@@ -80,6 +128,7 @@ void main(uint3 tid : SV_GroupThreadID)
       return 3;
 
     ID3D12RootSignaturePtr rs = MakeSig({
+        constParam(D3D12_SHADER_VISIBILITY_ALL, 0, 0, 1),
         uavParam(D3D12_SHADER_VISIBILITY_ALL, 0, 0),
         uavParam(D3D12_SHADER_VISIBILITY_ALL, 0, 1),
     });
@@ -103,9 +152,20 @@ void main(uint3 tid : SV_GroupThreadID)
     ID3D12ResourcePtr outBuf = MakeBuffer().Size(sizeof(Vec4f) * 64 * 2).UAV();
 
     D3D12_GPU_DESCRIPTOR_HANDLE outUAVGPU =
-        MakeUAV(outBuf).Format(DXGI_FORMAT_R32G32B32A32_FLOAT).CreateGPU(0);
+        MakeUAV(outBuf).Format(DXGI_FORMAT_R32G32B32A32_FLOAT).CreateGPU(10);
     D3D12_CPU_DESCRIPTOR_HANDLE outUAVClearCPU =
-        MakeUAV(outBuf).Format(DXGI_FORMAT_R32G32B32A32_FLOAT).CreateClearCPU(0);
+        MakeUAV(outBuf).Format(DXGI_FORMAT_R32G32B32A32_FLOAT).CreateClearCPU(10);
+
+    int numCompTests = 0;
+    size_t pos = 0;
+    while(pos != std::string::npos)
+    {
+      pos = comp.find("IsTest(", pos);
+      if(pos == std::string::npos)
+        break;
+      pos += sizeof("IsTest(") - 1;
+      numCompTests = std::max(numCompTests, atoi(comp.c_str() + pos) + 1);
+    }
 
     while(Running())
     {
@@ -119,30 +179,42 @@ void main(uint3 tid : SV_GroupThreadID)
 
       UINT zero[4] = {};
       D3D12_RECT rect = {0, 0, sizeof(Vec4f) * 64, 1};
-      cmd->ClearUnorderedAccessViewUint(outUAVGPU, outUAVClearCPU, outBuf, zero, 1, &rect);
-
-      ResourceBarrier(cmd);
 
       ClearRenderTargetView(cmd, BBRTV, {0.2f, 0.2f, 0.2f, 1.0f});
 
       cmd->SetComputeRootSignature(rs);
-      cmd->SetComputeRootUnorderedAccessView(0, inBuf->GetGPUVirtualAddress());
-      cmd->SetComputeRootUnorderedAccessView(1, outBuf->GetGPUVirtualAddress());
+      cmd->SetComputeRootUnorderedAccessView(1, inBuf->GetGPUVirtualAddress());
+      cmd->SetComputeRootUnorderedAccessView(2, outBuf->GetGPUVirtualAddress());
 
-      pushMarker(cmd, "Compute Tests");
-      setMarker(cmd, "SM5");
+      pushMarker(cmd, "SM5");
       cmd->SetPipelineState(pso50);
-      cmd->Dispatch(1, 1, 1);
+
+      for(int i = 0; i < numCompTests; ++i)
+      {
+        ResourceBarrier(cmd);
+        cmd->ClearUnorderedAccessViewUint(outUAVGPU, outUAVClearCPU, outBuf, zero, 1, &rect);
+        ResourceBarrier(cmd);
+        cmd->SetComputeRoot32BitConstant(0, i, 0);
+        cmd->Dispatch(1, 1, 1);
+      }
+
+      popMarker(cmd);
 
       if(pso60)
       {
-        setMarker(cmd, "SM6");
-        cmd->SetComputeRootUnorderedAccessView(1,
-                                               outBuf->GetGPUVirtualAddress() + sizeof(Vec4f) * 64);
+        pushMarker(cmd, "SM6");
         cmd->SetPipelineState(pso60);
-        cmd->Dispatch(1, 1, 1);
+
+        for(int i = 0; i < numCompTests; ++i)
+        {
+          ResourceBarrier(cmd);
+          cmd->ClearUnorderedAccessViewUint(outUAVGPU, outUAVClearCPU, outBuf, zero, 1, &rect);
+          ResourceBarrier(cmd);
+          cmd->SetComputeRoot32BitConstant(0, i, 0);
+          cmd->Dispatch(1, 1, 1);
+        }
+        popMarker(cmd);
       }
-      popMarker(cmd);
 
       FinishUsingBackbuffer(cmd, D3D12_RESOURCE_STATE_RENDER_TARGET);
 
